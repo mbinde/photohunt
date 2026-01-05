@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import CoreLocation
 
 struct HuntItemRow: View {
     @ObservedObject var item: HuntItemEntity
@@ -10,52 +11,81 @@ struct HuntItemRow: View {
     @State private var selectedPhotoItem: PhotosPickerItem?
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 14) {
             // Photo thumbnail or placeholder
             PhotoThumbnail(item: item)
-                .onTapGesture {
-                    if item.isFound {
-                        // If already has photo, show it larger (future feature)
-                    } else {
-                        showingOptions = true
-                    }
-                }
 
             // Item name and status
             VStack(alignment: .leading, spacing: 4) {
-                Text(item.name ?? "Unknown Item")
-                    .font(.body)
-                    .strikethrough(item.isFound)
-                    .foregroundStyle(item.isFound ? .secondary : .primary)
+                HStack(spacing: 6) {
+                    Text(item.name ?? "Unknown Item")
+                        .font(.body)
+                        .fontWeight(.medium)
+                        .foregroundStyle(Theme.textPrimary)
+
+                    if item.isFound {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(Theme.found)
+                            .font(.body)
+                    }
+                }
 
                 if item.isFound {
-                    Text("Found!")
-                        .font(.caption)
-                        .foregroundStyle(.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        // Timestamp
+                        if let foundAt = item.foundAt {
+                            HStack(spacing: 4) {
+                                Image(systemName: "clock.fill")
+                                    .font(.caption2)
+                                Text(foundAt.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption2)
+                            }
+                            .foregroundStyle(Theme.textSecondary)
+                        }
+
+                        // Location indicator
+                        if item.latitude != 0 || item.longitude != 0 {
+                            HStack(spacing: 4) {
+                                Image(systemName: "location.fill")
+                                    .font(.caption2)
+                                Text("Location saved")
+                                    .font(.caption2)
+                            }
+                            .foregroundStyle(Theme.accentMint)
+                        }
+                    }
                 }
             }
 
             Spacer()
 
-            // Action button
+            // Camera button (only shown when no photo yet)
             if !item.isFound {
-                Button(action: { showingOptions = true }) {
-                    Image(systemName: "camera.fill")
-                        .font(.title2)
-                        .foregroundStyle(.blue)
-                }
-                .buttonStyle(.plain)
-            } else {
-                Button(action: { clearPhoto() }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
+                Image(systemName: "camera.fill")
+                    .font(.title2)
+                    .foregroundStyle(Theme.lavender)
+                    .padding(10)
+                    .background(
+                        Circle()
+                            .fill(Theme.lavenderLight)
+                    )
             }
         }
-        .padding(.vertical, 8)
-        .confirmationDialog("Add Photo", isPresented: $showingOptions) {
+        .contentShape(Rectangle())
+        .onTapGesture {
+            showingOptions = true
+        }
+        .padding()
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(.white)
+                .shadow(color: Theme.lavender.opacity(0.2), radius: 4, x: 0, y: 2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(item.isFound ? Theme.found.opacity(0.5) : Theme.lavenderLight, lineWidth: 1.5)
+        )
+        .confirmationDialog(item.isFound ? "Replace Photo" : "Add Photo", isPresented: $showingOptions) {
             Button("Take Photo") {
                 showingCamera = true
             }
@@ -65,37 +95,72 @@ struct HuntItemRow: View {
             Button("Cancel", role: .cancel) { }
         }
         .sheet(isPresented: $showingCamera) {
-            PhotoCaptureView { image in
-                savePhoto(image)
+            PhotoCaptureView { image, metadata in
+                savePhoto(image, metadata: metadata)
             }
         }
         .photosPicker(isPresented: $showingPhotoPicker, selection: $selectedPhotoItem, matching: .images)
         .onChange(of: selectedPhotoItem) { oldValue, newValue in
             Task {
-                if let newValue,
-                   let data = try? await newValue.loadTransferable(type: Data.self),
-                   let image = UIImage(data: data) {
-                    savePhoto(image)
-                }
+                await processSelectedPhoto(newValue)
             }
         }
     }
 
-    private func savePhoto(_ image: UIImage) {
+    private func processSelectedPhoto(_ photoItem: PhotosPickerItem?) async {
+        guard let photoItem else { return }
+
+        // Load image data
+        guard let data = try? await photoItem.loadTransferable(type: Data.self),
+              let image = UIImage(data: data) else { return }
+
+        var metadata = PhotoMetadata()
+
+        // Extract metadata from photo
+        if let imageSource = CGImageSourceCreateWithData(data as CFData, nil),
+           let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [String: Any] {
+
+            // Extract location
+            if let gpsData = properties[kCGImagePropertyGPSDictionary as String] as? [String: Any] {
+                if let lat = gpsData[kCGImagePropertyGPSLatitude as String] as? Double,
+                   let latRef = gpsData[kCGImagePropertyGPSLatitudeRef as String] as? String,
+                   let lon = gpsData[kCGImagePropertyGPSLongitude as String] as? Double,
+                   let lonRef = gpsData[kCGImagePropertyGPSLongitudeRef as String] as? String {
+                    let latitude = latRef == "S" ? -lat : lat
+                    let longitude = lonRef == "W" ? -lon : lon
+                    metadata.location = CLLocation(latitude: latitude, longitude: longitude)
+                }
+            }
+
+            // Extract date taken
+            if let exifData = properties[kCGImagePropertyExifDictionary as String] as? [String: Any],
+               let dateString = exifData[kCGImagePropertyExifDateTimeOriginal as String] as? String {
+                let formatter = DateFormatter()
+                formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+                metadata.dateTaken = formatter.date(from: dateString)
+            }
+        }
+
+        await MainActor.run {
+            savePhoto(image, metadata: metadata)
+        }
+    }
+
+    private func savePhoto(_ image: UIImage, metadata: PhotoMetadata) {
         if let data = image.jpegData(compressionQuality: 0.8) {
             item.photoData = data
             item.isFound = true
-            item.foundAt = Date()
+            item.foundAt = metadata.dateTaken ?? Date()
+
+            if let location = metadata.location {
+                item.latitude = location.coordinate.latitude
+                item.longitude = location.coordinate.longitude
+            }
+
             try? viewContext.save()
         }
     }
 
-    private func clearPhoto() {
-        item.photoData = nil
-        item.isFound = false
-        item.foundAt = nil
-        try? viewContext.save()
-    }
 }
 
 struct PhotoThumbnail: View {
@@ -109,17 +174,17 @@ struct PhotoThumbnail: View {
                     .resizable()
                     .scaledToFill()
             } else {
-                Image(systemName: "photo")
-                    .font(.title)
-                    .foregroundStyle(.secondary)
+                Image(systemName: "camera.viewfinder")
+                    .font(.title2)
+                    .foregroundStyle(Theme.lavender)
             }
         }
-        .frame(width: 60, height: 60)
-        .background(Color(.systemGray5))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .frame(width: 65, height: 65)
+        .background(Theme.lavenderLight)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(item.isFound ? Color.green : Color.clear, lineWidth: 2)
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(item.isFound ? Theme.found : Theme.lavenderLight, lineWidth: 2)
         )
     }
 }
